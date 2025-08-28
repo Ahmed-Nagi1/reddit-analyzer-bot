@@ -138,3 +138,8 @@ requests.exceptions.ReadTimeout: HTTPSConnectionPool(host='api.telegram.org', po
 
 2025-08-27 16:12:21,558 - TeleBot - ERROR - Infinity polling: polling exited
 2025-08-27 16:12:21,559 - TeleBot - ERROR - Break infinity polling
+2025-08-28 06:56:52,937 - apscheduler.scheduler - INFO - Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2025-08-28 06:56:52,938 - apscheduler.scheduler - INFO - Added job "TelegramBot._scheduled_analysis" to job store "default"
+2025-08-28 06:56:52,938 - apscheduler.scheduler - INFO - Scheduler started
+2025-08-28 06:56:52,939 - __main__ - INFO - Scheduler started - will analyze posts every 2 hours
+2025-08-28 06:56:52,939 - __main__ - INFO - Starting Personal Reddit Analyzer Bot...
