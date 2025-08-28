@@ -88,9 +88,10 @@ Prioritize:
 You are a telegram bot.  
 - Output: single string, ≤4000 characters, ready for Telegram HTML.  
 -Format roles:
+    Do NOT use any unsupported tags such as <ul>, <li>, <div>, <span>, <h1>, etc. 
+
     Use only the supported tags: <b>, <i>, <u>, <s>, <em>, <code>, <pre>, <strong>, <blockquote>, <a href="URL">.
 
-    Do NOT use any unsupported tags such as <ul>, <li>, <div>, <span>, <h1>, etc.
 
     Ensure all tags are properly closed: every opening tag must have a matching closing tag.
 
@@ -101,6 +102,8 @@ You are a telegram bot.
     Bad Request: can't parse entities: Unmatched end tag
 
     Bad Request: can't parse entities: Unexpected end tag
+
+    Do NOT use any unsupported tags such as <ul>, <li>, <div>, <span>, <h1>, etc.
 
     Goal: Ensure the text is valid for Telegram and won’t cause any tag parsing errors.""")
         print(f"{Colors.OKGREEN}✅ Created prompt.txt with default analysis prompt{Colors.RESET}")
@@ -139,9 +142,9 @@ def main():
     print(f"{Colors.OKCYAN}1. Edit .env file with your API credentials")
     print("2. Get Telegram Bot token from @BotFather")
     print("3. Get Reddit API credentials from https://reddit.com/prefs/apps")
-    print("4. Get OpenAI API key from https://platform.openai.com")
+    print("4. Get OpenAI API key from https://platform.openai.com or z.ai for free GLM-4.5-Flash model")
     print("5. Start the bot with: python bot.py")
-    print("6. Message your bot to get your PERSONAL_CHAT_ID and add it to .env{Colors.RESET}")
+    print(f"6. Message your bot to get your PERSONAL_CHAT_ID and add it to .env{Colors.RESET}")
 
 if __name__ == "__main__":
     main()

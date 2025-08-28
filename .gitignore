@@ -22,6 +22,7 @@ build/
 
 # Text files for internal use
 subreddits.txt
+prompt.txt
 processed_posts.txt
 dev-bot.py
 

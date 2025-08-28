@@ -10,12 +10,13 @@ import logging
 import threading
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 import concurrent.futures
 
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import praw
+import prawcore
 import openai
 import zai
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -115,7 +116,7 @@ If the content is not particularly noteworthy, briefly explain why and provide a
         self._save_subreddits()
 
 class RedditAnalyzer:
-    """Reddit data fetcher and analyzer (batch analysis)"""
+    """Reddit data fetcher and analyzer with persistent state"""
     
     def __init__(self, config: Config):
         self.config = config
@@ -134,8 +135,29 @@ class RedditAnalyzer:
                 api_key=config.zai_api_key,
             )
 
-        self.processed_posts = set()
-    
+        self.processed_posts_file = 'processed_posts.txt'
+        self.processed_posts: Set[str] = self._load_processed_posts()
+        self.lock = threading.Lock()
+
+    def _load_processed_posts(self) -> Set[str]:
+        """Load processed post IDs from a file."""
+        try:
+            with open(self.processed_posts_file, 'r', encoding='utf-8') as f:
+                return {line.strip() for line in f if line.strip()}
+        except FileNotFoundError:
+            logger.info(f"'{self.processed_posts_file}' not found. Starting with an empty set.")
+            return set()
+
+    def _save_processed_posts(self):
+        """Save processed post IDs to a file."""
+        with self.lock:
+            try:
+                with open(self.processed_posts_file, 'w', encoding='utf-8') as f:
+                    for post_id in self.processed_posts:
+                        f.write(f"{post_id}\n")
+            except IOError as e:
+                logger.error(f"Failed to save processed posts: {e}")
+
     def fetch_posts(self, subreddit_name: str, limit: int = 8) -> List[Dict]:
         """Fetch recent posts from a subreddit"""
         try:
@@ -146,7 +168,7 @@ class RedditAnalyzer:
                 if submission.id in self.processed_posts:
                     continue
                 
-                if time.time() - submission.created_utc > 86400:
+                if time.time() - submission.created_utc > 86400: # Older than 24 hours
                     continue
                 
                 submission.comments.replace_more(limit=5)
@@ -161,25 +183,25 @@ class RedditAnalyzer:
                 
                 if submission.score > 5 or len(comments) > 2:
                     post_data = {
-                        'id': submission.id,
-                        'title': submission.title,
-                        'selftext': submission.selftext[:1000],
-                        'url': submission.url,
-                        'score': submission.score,
-                        'num_comments': submission.num_comments,
-                        'created_utc': submission.created_utc,
-                        'subreddit': subreddit_name,
-                        'permalink': submission.permalink,
-                        'comments': comments
+                        'id': submission.id, 'title': submission.title, 'selftext': submission.selftext[:1000],
+                        'url': submission.url, 'score': submission.score, 'num_comments': submission.num_comments,
+                        'created_utc': submission.created_utc, 'subreddit': subreddit_name,
+                        'permalink': submission.permalink, 'comments': comments
                     }
-                    
                     posts.append(post_data)
-                    self.processed_posts.add(submission.id)
+                    with self.lock:
+                        self.processed_posts.add(submission.id)
+            
+            if posts: # Save only if new posts were found
+                self._save_processed_posts()
             
             return posts
         
+        except prawcore.exceptions.PrawcoreException as e:
+            logger.error(f"PRAW error fetching from r/{subreddit_name}: {e}")
+            return []
         except Exception as e:
-            logger.error(f"Error fetching posts from r/{subreddit_name}: {e}")
+            logger.error(f"Unexpected error fetching posts from r/{subreddit_name}: {e}")
             return []
 
     def analyze_posts_batch(self, posts: List[Dict]) -> Optional[str]:
@@ -195,6 +217,7 @@ TITLE: {post['title']}
 SUBREDDIT: r/{post['subreddit']}
 SCORE: {post['score']} upvotes | {post['num_comments']} comments
 TIME: {datetime.fromtimestamp(post['created_utc']).strftime('%Y-%m-%d %H:%M')}
+URL: https://www.reddit.com{post['permalink']}
 
 POST CONTENT:
 {post['selftext'] if post['selftext'] else 'No text content (link post)'}
@@ -204,7 +227,6 @@ TOP COMMENTS:
             sorted_comments = sorted(post['comments'], key=lambda x: x['score'], reverse=True)
             for i, comment in enumerate(sorted_comments[:8], 1):
                 post_text += f"\n{i}. [↑{comment['score']}] u/{comment['author']}: {comment['body']}\n"
-
             combined_content += post_text + "\n\n"
 
         try:
@@ -214,32 +236,26 @@ TOP COMMENTS:
                     messages=[
                         {"role": "system", "content": self.config.analysis_prompt},
                         {"role": "user", "content": f"CONTENT TO ANALYZE:\n{combined_content}"}
-                    ],
-                    max_tokens=4000,
-                    temperature=0.7
+                    ], max_tokens=4000, temperature=0.7
                 )
             else:
-                print(combined_content)
                 response = self.zai_client.chat.completions.create(
                     model=self.config.model_name,
                     messages=[
                         {"role": "system", "content": self.config.analysis_prompt},
                         {"role": "user", "content": f"CONTENT TO ANALYZE:\n{combined_content}"}
-                    ],
-                    thinking={"type": "disabled"},
-                    max_tokens=4000,
-                    temperature=0.7
+                    ], thinking={"type": "disabled"}, max_tokens=4000, temperature=0.7
                 )
-
+            
             analysis = response.choices[0].message.content.strip()
-            if analysis:
-                return analysis
+            return analysis if analysis else None
 
+        except openai.APIError as e:
+            logger.error(f"OpenAI API error: {e}")
+            return f"Error: Could not analyze posts due to an AI API error: {e}"
         except Exception as e:
-            logger.error(f"AI API error while analyzing posts batch: {e}")
-            return None
-
-        return None
+            logger.error(f"Unexpected error during AI analysis: {e}")
+            return "Error: An unexpected error occurred during analysis."
 
 class TelegramBot:
     """Main Telegram bot class"""
@@ -248,231 +264,242 @@ class TelegramBot:
         self.config = config
         self.bot = telebot.TeleBot(config.telegram_token)
         self.reddit_analyzer = RedditAnalyzer(config)
-        self.scheduler = BackgroundScheduler()
-        
+        self.scheduler = BackgroundScheduler(timezone="UTC")
         self._setup_handlers()
         self._start_scheduler()
     
+    def _run_analysis_in_thread(self, chat_id):
+        """Helper to run analysis in a new thread to avoid blocking the bot."""
+        analysis_thread = threading.Thread(target=self._perform_analysis, args=(chat_id,))
+        analysis_thread.start()
+
     def _setup_handlers(self):
         """Setup bot command and callback handlers"""
-        
         @self.bot.message_handler(commands=['start'])
         def send_welcome(message):
-            welcome_text = f"""
-<b>🤖 Personal Reddit Analyzer Bot</b>\n\n
-I analyze Reddit posts and comments to extract valuable insights using AI!\n\n
-<b>Commands:</b>\n
-• /start - Show this welcome message\n
-• /analyze - Manually trigger analysis now\n
-• /subreddits - View and manage your subreddits\n
-• /status - Check bot status and statistics\n
-• /settings - Bot settings and configuration\n\n
-I automatically analyze posts every 2 hours and send you summaries of interesting content.\n\n
-<b>Current Subreddits:</b> {', '.join(f'r/{sub}' for sub in self.config.subreddits)}
-"""
-            
+            welcome_text = (
+                f"<b>🤖 Personal Reddit Analyzer Bot</b>\n\n"
+                f"I analyze Reddit posts and comments to extract valuable insights using AI!\n\n"
+                f"<b>Commands:</b>\n"
+                f"• /start - Show this welcome message\n"
+                f"• /analyze - Manually trigger analysis now\n"
+                f"• /subreddits - View and manage your subreddits\n"
+                f"• /status - Check bot status and statistics\n\n"
+                f"I automatically analyze posts every 2 hours.\n\n"
+                f"<b>Current Subreddits:</b> {', '.join(f'r/{sub}' for sub in self.config.subreddits)}"
+            )
             keyboard = InlineKeyboardMarkup()
             keyboard.row(
                 InlineKeyboardButton("🔄 Analyze Now", callback_data="analyze_now"),
                 InlineKeyboardButton("📋 Manage Subreddits", callback_data="manage_subreddits")
             )
-            
-            self.bot.reply_to(message, welcome_text, reply_markup=keyboard, parse_mode='HTML')
+            self.bot.send_message(message.chat.id, welcome_text, reply_markup=keyboard, parse_mode='HTML')
         
         @self.bot.message_handler(commands=['analyze'])
         def manual_analyze(message):
-            self.bot.reply_to(message, "🔄 Starting analysis of your subreddits...")
-            self._perform_analysis(message.chat.id)
+            self.bot.reply_to(message, "🔄 Analysis has been started in the background. I'll send the results shortly.")
+            self._run_analysis_in_thread(message.chat.id)
         
         @self.bot.message_handler(commands=['subreddits'])
         def show_subreddits(message):
-            text = "<b>📋 Your Monitored Subreddits:</b>\n\n"
-            for i, sub in enumerate(self.config.subreddits, 1):
-                text += f"{i}. r/{sub}\n"
-            
-            keyboard = InlineKeyboardMarkup()
-            keyboard.row(
-                InlineKeyboardButton("✏️ Edit List", callback_data="edit_subreddits"),
-                InlineKeyboardButton("➕ Add Subreddit", callback_data="add_subreddit")
-            )
-            
-            self.bot.reply_to(message, text, reply_markup=keyboard, parse_mode='HTML')
+            self._show_subreddit_manager(message.chat.id)
         
         @self.bot.message_handler(commands=['status'])
         def show_status(message):
-            status_text = f"""
-<b>📊 Bot Status</b>\n\n
-🔹 <b>Active Subreddits:</b> {len(self.config.subreddits)}\n
-🔹 <b>Processed Posts:</b> {len(self.reddit_analyzer.processed_posts)}\n
-🔹 <b>Last Analysis:</b> Check logs for details\n
-🔹 <b>Auto-Analysis:</b> Every 2 hours\n\n
-<b>Monitored Subreddits:</b>\n
-{'\n'.join(f'• r/{sub}' for sub in self.config.subreddits)}
-"""
-            
+            subreddits_list = '\n'.join(f'• r/{sub}' for sub in self.config.subreddits)
+
+            status_text = (
+    f"<b>📊 Bot Status</b>\n\n"
+    f"🔹 <b>Active Subreddits:</b> {len(self.config.subreddits)}\n"
+    f"🔹 <b>Processed Posts (since last restart):</b> {len(self.reddit_analyzer.processed_posts)}\n"
+    f"🔹 <b>Auto-Analysis:</b> Every 2 hours\n\n"
+    f"<b>Monitored Subreddits:</b>\n"
+    f"{subreddits_list}"
+)
+
             keyboard = InlineKeyboardMarkup()
             keyboard.add(InlineKeyboardButton("🔄 Analyze Now", callback_data="analyze_now"))
-            
-            self.bot.reply_to(message, status_text, reply_markup=keyboard, parse_mode='HTML')
+            self.bot.send_message(message.chat.id, status_text, reply_markup=keyboard, parse_mode='HTML')
         
         @self.bot.message_handler(commands=['settings'])
         def show_settings(message):
-            settings_text = f"""
-<b>⚙️ Bot Settings</b>\n\n
-📝 <b>Analysis Prompt:</b> Loaded from prompt.txt\n
-📋 <b>Subreddits:</b> Loaded from subreddits.txt\n\n
-You can edit these files directly to customize the bot's behavior.
-"""
-            self.bot.reply_to(message, settings_text, parse_mode='HTML')
-        
-        @self.bot.callback_query_handler(func=lambda call: True)
-        def callback_query(call):
-            if call.data == "manage_subreddits":
-                self._show_subreddit_manager(call.message.chat.id)
-            elif call.data == "analyze_now":
-                self.bot.answer_callback_query(call.id, "Starting analysis...")
-                self._perform_analysis(call.message.chat.id)
-            elif call.data == "edit_subreddits":
-                self.bot.send_message(
-                    call.message.chat.id,
-                    "<b>📝 Edit Subreddit List</b>\n\nSend me a comma-separated list of subreddits (without r/):\n\n<i>Example:</i> Python,MachineLearning,Programming,DataScience",
-                    parse_mode='HTML'
-                )
-                self.bot.register_next_step_handler_by_chat_id(
-                    call.message.chat.id, self._process_subreddit_update
-                )
-            elif call.data == "add_subreddit":
-                self.bot.send_message(
-                    call.message.chat.id,
-                    "<b>➕ Add Subreddit</b>\n\nSend me the name of the subreddit to add (without r/):\n\n<i>Example:</i> Python",
-                    parse_mode='HTML'
-                )
-                self.bot.register_next_step_handler_by_chat_id(
-                    call.message.chat.id, self._process_add_subreddit
-                )
-        
-        @self.bot.message_handler(func=lambda message: True)
-        def handle_all_messages(message):
-            self.bot.reply_to(
-                message, 
-                "👋 Use /start to see available commands, or /analyze to analyze Reddit posts now!"
-            )
-    
-    def _show_subreddit_manager(self, chat_id):
-        """Show subreddit management interface"""
-        text = f"""
-<b>📋 Subreddit Manager</b>\n\n
-<b>Currently monitoring:</b>\n
-{'\n'.join(f'• r/{sub}' for sub in self.config.subreddits)}\n\n
-<b>Total:</b> {len(self.config.subreddits)} subreddits
-"""
-        
-        keyboard = InlineKeyboardMarkup()
-        keyboard.row(
-            InlineKeyboardButton("✏️ Replace All", callback_data="edit_subreddits"),
-            InlineKeyboardButton("➕ Add One", callback_data="add_subreddit")
-        )
-        
-        self.bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='HTML')
-    
-    def _process_subreddit_update(self, message):
-        """Process subreddit list update"""
-        try:
-            subreddit_text = message.text.strip()
-            subreddits = [sub.strip() for sub in subreddit_text.split(',') if sub.strip()]
-            
-            if not subreddits:
-                self.bot.reply_to(message, "❌ Please provide at least one subreddit!")
-                return
-            
-            self.config.set_subreddits(subreddits)
-            
-            response_text = "<b>✅ Subreddit List Updated!</b>\n\n<b>Now monitoring:</b>\n"
-            response_text += "\n".join(f"• r/{sub}" for sub in subreddits)
-            
-            self.bot.reply_to(message, response_text, parse_mode='HTML')
-        
-        except Exception as e:
-            logger.error(f"Error updating subreddits: {e}")
-            self.bot.reply_to(message, "❌ Error updating subreddits. Please try again.")
-    
-    def _process_add_subreddit(self, message):
-        """Process adding a single subreddit"""
-        try:
-            subreddit = message.text.strip()
-            
-            if not subreddit:
-                self.bot.reply_to(message, "❌ Please provide a subreddit name!")
-                return
-            
-            if subreddit in self.config.subreddits:
-                self.bot.reply_to(message, f"📋 r/{subreddit} is already in your list!")
-                return
-            
-            self.config.add_subreddit(subreddit)
-            self.bot.reply_to(message, f"✅ Added r/{subreddit} to your monitoring list!")
-        
-        except Exception as e:
-            logger.error(f"Error adding subreddit: {e}")
-            self.bot.reply_to(message, "❌ Error adding subreddit. Please try again.")
-        
-    def _perform_analysis(self, chat_id):
-        """Perform Reddit analysis and send results (batch per subreddit)"""
-        try:
-            self.bot.send_message(
-                chat_id,
-                f"🔍 <b>Starting Analysis</b>\n\nAnalyzing posts from: {', '.join(f'r/{sub}' for sub in self.config.subreddits)}",
+            self.bot.send_message(message.chat.id,
+                "<b>⚙️ Bot Settings</b>\n\n"
+                "📝 <b>Analysis Prompt:</b> Loaded from `prompt.txt`\n"
+                "📋 <b>Subreddits:</b> Loaded from `subreddits.txt`\n\n"
+                "You can edit these files directly to customize the bot's behavior.",
                 parse_mode='HTML'
             )
 
-            total_analyses = 0
-            posts_count_per_sub = {}  # <--- لتخزين عدد البوستات لكل مجتمع
+        @self.bot.callback_query_handler(func=lambda call: True)
+        def callback_query(call):
+            if call.data == "manage_subreddits":
+                self._show_subreddit_manager(call.message.chat.id, call.message.message_id)
+            elif call.data == "analyze_now":
+                self.bot.answer_callback_query(call.id, "Starting analysis in the background...")
+                self._run_analysis_in_thread(call.message.chat.id)
+            elif call.data == "edit_subreddits":
+                msg = self.bot.send_message(call.message.chat.id,
+                    "<b>📝 Replace Subreddit List</b>\n\nSend a comma-separated list of new subreddits (e.g., Python,datascience,learnpython).",
+                    parse_mode='HTML'
+                )
+                self.bot.register_next_step_handler(msg, self._process_subreddit_update)
+            elif call.data == "add_subreddit":
+                msg = self.bot.send_message(call.message.chat.id,
+                    "<b>➕ Add Subreddit</b>\n\nSend the name of the subreddit to add (e.g., MachineLearning).",
+                    parse_mode='HTML'
+                )
+                self.bot.register_next_step_handler(msg, self._process_add_subreddit)
+            elif call.data == "remove_subreddit":
+                self._show_remove_subreddit_menu(call.message.chat.id, call.message.message_id)
+            elif call.data.startswith("delete_sub_"):
+                subreddit_to_delete = call.data.split('_', 2)[2]
+                self.config.remove_subreddit(subreddit_to_delete)
+                self.bot.answer_callback_query(call.id, f"✅ Removed r/{subreddit_to_delete}")
+                self._show_remove_subreddit_menu(call.message.chat.id, call.message.message_id)
 
-            for subreddit in self.config.subreddits:
-                try:
-                    self.bot.send_message(chat_id, f"📡 Fetching from r/{subreddit}...", parse_mode='HTML')
-                    posts = self.reddit_analyzer.fetch_posts(subreddit, limit=8)
-                    posts_count_per_sub[subreddit] = len(posts)  # <--- حفظ عدد البوستات
+    def _show_subreddit_manager(self, chat_id, message_id=None):
+        if self.config.subreddits:
+            subreddits_list = '\n'.join(f'• r/{sub}' for sub in self.config.subreddits)
+        else:
+            subreddits_list = 'None'
 
-                    if not posts:
-                        continue
+        text = (
+    f"<b>📋 Subreddit Manager</b>\n\n"
+    f"<b>Currently monitoring:</b>\n"
+    f"{subreddits_list}\n\n"
+    f"<b>Total:</b> {len(self.config.subreddits)} subreddits"
+)
 
-                    analysis = self.reddit_analyzer.analyze_posts_batch(posts)
-                    if analysis:
-                        if len(analysis) > 4000:
-                            parts = [analysis[i:i+3800] for i in range(0, len(analysis), 3800)]
-                            for i, part in enumerate(parts):
-                                if i == 0:
-                                    self.bot.send_message(chat_id, part, parse_mode='HTML', disable_web_page_preview=True)
-                                else:
-                                    self.bot.send_message(chat_id, f"<b>...continued</b>\n\n{part}", parse_mode='HTML')
-                        else:
-                            self.bot.send_message(chat_id, analysis, parse_mode='HTML', disable_web_page_preview=True)
-                        
-                        total_analyses += 1
-                        time.sleep(2)
+        keyboard = InlineKeyboardMarkup()
+        keyboard.row(
+            InlineKeyboardButton("➕ Add", callback_data="add_subreddit"),
+            InlineKeyboardButton("➖ Remove", callback_data="remove_subreddit")
+        )
+        keyboard.add(InlineKeyboardButton("✏️ Replace All", callback_data="edit_subreddits"))
+        
+        try:
+            if message_id:
+                self.bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard, parse_mode='HTML')
+            else:
+                self.bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='HTML')
+        except telebot.apihelper.ApiTelegramException as e:
+            if "message is not modified" in str(e):
+                pass
+            else:
+                logger.error(f"Error showing subreddit manager: {e}")
+                self.bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='HTML')
 
-                except Exception as e:
-                    logger.error(f"Error analyzing r/{subreddit}: {e}")
-                    self.bot.send_message(chat_id, f"⚠️ Error analyzing r/{subreddit}: {str(e)}", parse_mode='HTML')
+    def _show_remove_subreddit_menu(self, chat_id, message_id):
+        text = "<b>➖ Remove Subreddit</b>\n\nSelect a subreddit to remove:"
+        keyboard = InlineKeyboardMarkup()
+        for subreddit in self.config.subreddits:
+            keyboard.add(InlineKeyboardButton(f"❌ r/{subreddit}", callback_data=f"delete_sub_{subreddit}"))
+        keyboard.add(InlineKeyboardButton("🔙 Back to Manager", callback_data="manage_subreddits"))
+        
+        try:
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard, parse_mode='HTML')
+        except telebot.apihelper.ApiTelegramException as e:
+            if "message is not modified" in str(e):
+                self.bot.answer_callback_query(call.id, "List is already up to date.")
+            else:
+                logger.error(f"Error editing message for remove menu: {e}")
+                self.bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='HTML')
+
+    def _process_subreddit_update(self, message):
+        try:
+            subreddits = [sub.strip() for sub in message.text.split(',') if sub.strip()]
+            if not subreddits:
+                self.bot.reply_to(message, "❌ Invalid input. Please provide at least one subreddit.")
+                return
+            self.config.set_subreddits(subreddits)
+            response_text = "<b>✅ Subreddit List Updated!</b>\n\n<b>Now monitoring:</b>\n" + "\n".join(f"• r/{sub}" for sub in subreddits)
+            self.bot.reply_to(message, response_text, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Error updating subreddits: {e}")
+            self.bot.reply_to(message, "❌ An error occurred. Please try again.")
+    
+    def _process_add_subreddit(self, message):
+        try:
+            subreddit = message.text.strip().split(" ")[0] # Take first word to be safe
+            if not subreddit:
+                self.bot.reply_to(message, "❌ Invalid input. Please provide a subreddit name.")
+                return
+            if subreddit in self.config.subreddits:
+                self.bot.reply_to(message, f"📋 r/{subreddit} is already being monitored.")
+                return
+            self.config.add_subreddit(subreddit)
+            self.bot.reply_to(message, f"✅ Added r/{subreddit} to your monitoring list!")
+        except Exception as e:
+            logger.error(f"Error adding subreddit: {e}")
+            self.bot.reply_to(message, "❌ An error occurred. Please try again.")
+        
+    def _send_long_message(self, chat_id, text, **kwargs):
+        """Splits a long message into multiple parts."""
+        max_length = 4096
+        if len(text) <= max_length:
+            self.bot.send_message(chat_id, text, **kwargs)
+            return
+        
+        parts = []
+        while len(text) > 0:
+            if len(text) > max_length:
+                part = text[:max_length]
+                last_newline = part.rfind('\n')
+                if last_newline != -1:
+                    parts.append(text[:last_newline])
+                    text = text[last_newline+1:]
+                else:
+                    parts.append(text[:max_length])
+                    text = text[max_length:]
+            else:
+                parts.append(text)
+                break
+        
+        for i, part in enumerate(parts):
+            if i > 0:
+                self.bot.send_message(chat_id, f"<b>...continued</b>\n\n{part}", **kwargs)
+            else:
+                self.bot.send_message(chat_id, part, **kwargs)
+            time.sleep(1)
+
+    def _perform_analysis(self, chat_id):
+        logger.info(f"Starting analysis for chat_id: {chat_id}")
+        self.bot.send_message(chat_id, f"🔍 <b>Starting Analysis</b> for {len(self.config.subreddits)} subreddits...", parse_mode='HTML')
+        
+        total_new_posts = 0
+        summary_lines = []
+        
+        for subreddit in self.config.subreddits:
+            try:
+                posts = self.reddit_analyzer.fetch_posts(subreddit, limit=8)
+                if not posts:
+                    summary_lines.append(f"• r/{subreddit}: No new posts found.")
                     continue
 
-            # إرسال ملخص بعد اكتمال التحليل
-            if total_analyses == 0:
-                self.bot.send_message(chat_id, "<b>📭 No New Content</b>\n\nNo new interesting posts found.", parse_mode='HTML')
-            else:
-                summary_text = "✅ <b>Analysis Complete!</b>\n\n"
-                for sub, count in posts_count_per_sub.items():
-                    summary_text += f"• r/{sub}: {count} posts\n"
-                self.bot.send_message(chat_id, summary_text, parse_mode='HTML')
+                summary_lines.append(f"• r/{subreddit}: Found {len(posts)} new posts, analyzing...")
+                self.bot.send_message(chat_id, f"Found {len(posts)} new post(s) in r/{subreddit}. Analyzing now...")
+                
+                analysis = self.reddit_analyzer.analyze_posts_batch(posts)
+                if analysis:
+                    self._send_long_message(chat_id, analysis, parse_mode='HTML', disable_web_page_preview=True)
+                    total_new_posts += len(posts)
+                else:
+                    self.bot.send_message(chat_id, f"Could not generate a summary for r/{subreddit}.")
+                
+                time.sleep(2) # Avoid rate limiting
+            except Exception as e:
+                logger.critical(f"A critical error occurred while processing r/{subreddit}: {e}", exc_info=True)
+                self.bot.send_message(chat_id, f"⚠️ An unexpected error occurred while processing r/{subreddit}. Check logs.")
+        
+        final_summary = "✅ <b>Analysis Complete!</b>\n\n" + "\n".join(summary_lines)
+        if total_new_posts == 0:
+            final_summary += "\n\n📭 No new interesting posts found across all subreddits."
 
-        except Exception as e:
-            logger.error(f"Error in analysis: {e}")
-            self.bot.send_message(chat_id, f"❌ <b>Analysis Error</b>\n\n{str(e)}", parse_mode='HTML')
-
+        self.bot.send_message(chat_id, final_summary, parse_mode='HTML')
+        logger.info(f"Finished analysis for chat_id: {chat_id}")
 
     def _start_scheduler(self):
-        """Start the background scheduler"""
         self.scheduler.add_job(
             func=self._scheduled_analysis,
             trigger="interval",
@@ -480,33 +507,33 @@ You can edit these files directly to customize the bot's behavior.
             id='reddit_analysis'
         )
         self.scheduler.start()
-        logger.info("Scheduler started - will analyze posts every 2 hours")
+        logger.info("Scheduler started - will analyze posts every 2 hours.")
     
     def _scheduled_analysis(self):
-        """Perform scheduled analysis"""
-        logger.info("Starting scheduled Reddit analysis")
-        
-        try:
-            personal_chat_id = os.getenv('PERSONAL_CHAT_ID')
-            
-            if personal_chat_id:
+        logger.info("Starting scheduled Reddit analysis...")
+        personal_chat_id = os.getenv('PERSONAL_CHAT_ID')
+        if personal_chat_id:
+            try:
                 self._perform_analysis(int(personal_chat_id))
-            else:
-                logger.warning("PERSONAL_CHAT_ID not set - skipping scheduled analysis")
-        
-        except Exception as e:
-            logger.error(f"Error in scheduled analysis: {e}")
+            except Exception as e:
+                logger.error(f"Error in scheduled analysis task: {e}", exc_info=True)
+        else:
+            logger.warning("PERSONAL_CHAT_ID not set - skipping scheduled analysis.")
     
     def run(self):
-        """Start the bot"""
         logger.info("Starting Personal Reddit Analyzer Bot...")
         try:
-            self.bot.infinity_polling(timeout=10, long_polling_timeout=5)
+            self.bot.infinity_polling(timeout=20, long_polling_timeout=10, logger_level=logging.WARNING)
         except Exception as e:
-            logger.error(f"Bot polling error: {e}")
+            logger.critical(f"Bot polling CRASHED: {e}", exc_info=True)
+            time.sleep(15) # Wait before restarting
 
 if __name__ == "__main__":
-    config = Config()
-    bot = TelegramBot(config)
-    bot.run()
-    print("Bot started...")
+    while True:
+        try:
+            config = Config()
+            bot = TelegramBot(config)
+            bot.run()
+        except Exception as main_exc:
+            logger.critical(f"Main loop failed: {main_exc}. Restarting in 30 seconds...", exc_info=True)
+            time.sleep(30)
