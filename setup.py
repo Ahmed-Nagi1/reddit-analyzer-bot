@@ -19,8 +19,8 @@ TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_BASE_URL=https://api.openai.com/v1
 
-# z.ai configuration for free GLM-4.5-Flash model
-USE_ZAI=false  #true or false
+# z.ai configuration for free GLM-4.5-Flash model (Optional)
+USE_ZAI=false  # true or false
 ZAI_API_KEY=your_zai_api_key_here
 
 MODEL_NAME=your_model_name

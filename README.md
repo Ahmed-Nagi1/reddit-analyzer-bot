@@ -10,13 +10,12 @@ A Telegram bot that monitors Reddit subreddits and analyzes posts/comments using
 - **Flexible Scheduling**: Manual analysis on demand or automatic analysis every 2 hours
 - **Subreddit Management**: Easily add, remove, and manage your monitored subreddits
 - **Customizable Prompts**: Modify analysis behavior through customizable prompts
-- **Arabic Language Support**: Outputs analysis summaries in Arabic
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/Ahmed-Nagi1/reddit-analyzer-bot
 cd reddit-analyzer-bot
 ```
 
