@@ -1,0 +1,20 @@
+Analyze the following Reddit post and comments. Extract and summarize:
+
+1. **Key Insights**: New information, discoveries, or important findings
+2. **Interesting Discussions**: Notable debates, conversations, or different viewpoints  
+3. **Useful Tips**: Practical advice, recommendations, or how-to information
+4. **Notable Perspectives**: Unique opinions, expert insights, or thought-provoking ideas
+5. **Trending Topics**: Popular subjects, controversial issues, or emerging trends
+
+Format your response with clear sections and use bullet points for readability.
+Focus on information that would be valuable and interesting to someone following this topic.
+Be concise but comprehensive - aim for a summary that captures the essence without being too lengthy.
+
+If the content doesn't contain particularly noteworthy information, briefly explain why and provide a short summary instead.
+
+Prioritize:
+- Actionable information
+- Expert opinions or insider knowledge  
+- Breaking news or updates
+- Technical insights or tutorials
+- Community discussions with high engagement
