@@ -10,6 +10,7 @@ A Telegram bot that monitors Reddit subreddits and analyzes posts/comments using
 - **Flexible Scheduling**: Manual analysis on demand or automatic analysis every 2 hours
 - **Subreddit Management**: Easily add, remove, and manage your monitored subreddits
 - **Customizable Prompts**: Modify analysis behavior through customizable prompts
+- **Persistent State**: The bot saves processed posts to a file to avoid re-analyzing them after a restart.
 
 ## Installation
 

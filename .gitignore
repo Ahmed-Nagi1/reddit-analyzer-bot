@@ -1,3 +1,27 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# Environment variables
 .env
-.venv
-bot.log
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python project artifacts
+*.egg-info/
+dist/
+build/
+
+# Text files for internal use
+subreddits.txt
+processed_posts.txt
+dev-bot.py
+

@@ -54,7 +54,8 @@ Technology""")
     if not os.path.exists('prompt.txt'):
         print("Creating prompt.txt...")
         with open('prompt.txt', 'w') as f:
-            f.write("""Start your summary with name of community
+            f.write("""
+Start your summary with name of community
 
 Analyze the following Reddit post and comments. Extract and summarize:
 
@@ -78,9 +79,26 @@ Prioritize:
 - Community discussions with high engagement
 
 
-You are a Telegram bot.  
+You are a telegram bot.  
 - Output: single string, ≤4000 characters, ready for Telegram HTML.  
-- Use only the following supported tags: <b>, <i>, <u>, <s>, <em>, <code>, <pre>, <strong>, <blockquote>,  ,<a href="URL">, <code>, <pre>. - Do NOT use any other tags such as <ul>, <li>, <div>, <span>, <h1>, etc. - Make sure all tags are properly closed. - Use <b> and <i> only for formatting headings. - Do not include any unsupported tags, even if they exist in the original text.""")
+-Format roles:
+    Use only the supported tags: <b>, <i>, <u>, <s>, <em>, <code>, <pre>, <strong>, <blockquote>, <a href="URL">.
+
+    Do NOT use any unsupported tags such as <ul>, <li>, <div>, <span>, <h1>, etc.
+
+    Ensure all tags are properly closed: every opening tag must have a matching closing tag.
+
+    Use <b> and <i> only for formatting headings, not for normal text or paragraphs.
+
+    Before sending the message, clean the text from any unsupported or unclosed tags.
+
+    If the text contains unsupported or incorrectly closed tags, reformat the text according to the rules above to avoid Telegram errors:
+
+    Bad Request: can't parse entities: Unmatched end tag
+
+    Bad Request: can't parse entities: Unexpected end tag
+
+    Goal: Ensure the text is valid for Telegram and won’t cause any tag parsing errors.""")
         print("✅ Created prompt.txt with default analysis prompt")
     else:
         print("✅ prompt.txt already exists")
