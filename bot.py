@@ -11,7 +11,7 @@ import threading
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-
+import concurrent.futures
 
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -114,9 +114,8 @@ If the content is not particularly noteworthy, briefly explain why and provide a
         self.subreddits = subreddits
         self._save_subreddits()
 
-
 class RedditAnalyzer:
-    """Reddit data fetcher and analyzer"""
+    """Reddit data fetcher and analyzer (batch analysis)"""
     
     def __init__(self, config: Config):
         self.config = config
@@ -125,7 +124,7 @@ class RedditAnalyzer:
             client_secret=config.reddit_client_secret,
             user_agent=config.reddit_user_agent
         )
-        if config.use_zai =="false":
+        if config.use_zai == "false":
             self.openai_client = openai.OpenAI(
                 api_key=config.openai_api_key,
                 base_url=config.openai_base_url,
@@ -137,7 +136,7 @@ class RedditAnalyzer:
 
         self.processed_posts = set()
     
-    def fetch_posts(self, subreddit_name: str, limit: int = 10) -> List[Dict]:
+    def fetch_posts(self, subreddit_name: str, limit: int = 8) -> List[Dict]:
         """Fetch recent posts from a subreddit"""
         try:
             subreddit = self.reddit.subreddit(subreddit_name)
@@ -147,27 +146,24 @@ class RedditAnalyzer:
                 if submission.id in self.processed_posts:
                     continue
                 
-                # Skip if post is too old (older than 24 hours)
                 if time.time() - submission.created_utc > 86400:
                     continue
                 
-                # Get comments
                 submission.comments.replace_more(limit=5)
                 comments = []
-                for comment in submission.comments.list()[:15]:  # Limit comments
+                for comment in submission.comments.list()[:15]:
                     if hasattr(comment, 'body') and len(comment.body) > 10 and comment.body != '[deleted]':
                         comments.append({
                             'author': str(comment.author) if comment.author else 'Unknown',
-                            'body': comment.body[:800],  # Truncate long comments
+                            'body': comment.body[:800],
                             'score': comment.score
                         })
                 
-                # Only analyze posts with some engagement
                 if submission.score > 5 or len(comments) > 2:
                     post_data = {
                         'id': submission.id,
                         'title': submission.title,
-                        'selftext': submission.selftext[:1000],  # Truncate long posts
+                        'selftext': submission.selftext[:1000],
                         'url': submission.url,
                         'score': submission.score,
                         'num_comments': submission.num_comments,
@@ -185,13 +181,17 @@ class RedditAnalyzer:
         except Exception as e:
             logger.error(f"Error fetching posts from r/{subreddit_name}: {e}")
             return []
-    
-    def analyze_post(self, post: Dict) -> Optional[str]:
-        """Analyze a single post and its comments using OpenAI"""
-        try:
-            # Prepare content for analysis
-            content = f"""
-POST TITLE: {post['title']}
+
+    def analyze_posts_batch(self, posts: List[Dict]) -> Optional[str]:
+        """Analyze multiple posts in a single AI request"""
+        if not posts:
+            return None
+
+        combined_content = ""
+        for idx, post in enumerate(posts, 1):
+            post_text = f"""
+POST #{idx}:
+TITLE: {post['title']}
 SUBREDDIT: r/{post['subreddit']}
 SCORE: {post['score']} upvotes | {post['num_comments']} comments
 TIME: {datetime.fromtimestamp(post['created_utc']).strftime('%Y-%m-%d %H:%M')}
@@ -201,59 +201,45 @@ POST CONTENT:
 
 TOP COMMENTS:
 """
-            
-            # Add top comments sorted by score
             sorted_comments = sorted(post['comments'], key=lambda x: x['score'], reverse=True)
             for i, comment in enumerate(sorted_comments[:8], 1):
-                content += f"\n{i}. [↑{comment['score']}] u/{comment['author']}: {comment['body']}\n"
-            
-            # Get analysis from OpenAI
-            try:
-                if config.use_zai == "false":
-                    response = self.openai_client.chat.completions.create(
-                        model=config.model_name,
-                        messages=[
-                            {"role": "system", "content": self.config.analysis_prompt},
-                            {"role": "user", "content": f"CONTENT TO ANALYZE:\n{content}"}
-                        ],
-                        max_tokens=800,
-                        temperature=0.7
-                    )
-                else:
-                    print("use zai")
-                    response = self.zai_client.chat.completions.create(
-                        model=config.model_name,
-                        messages=[
-                            {"role": "system", "content": self.config.analysis_prompt},
-                            {"role": "user", "content": f"CONTENT TO ANALYZE:\n{content}"}
-                        ],
-                            thinking={
-                                "type": "disabled",  # Optional: "disabled" or "enabled", default is "enabled"
-                            },
-                        max_tokens=800,
-                        temperature=0.7
-                    )
+                post_text += f"\n{i}. [↑{comment['score']}] u/{comment['author']}: {comment['body']}\n"
 
-                analysis = response.choices[0].message.content.strip()
-                
-                if analysis:
-                    # Format the response
-                    header = f"📊 **r/{post['subreddit']} Analysis**\n"
-                    header += f"**{post['title']}**\n"
-                    header += f"🔗 [View Post](https://reddit.com{post['permalink']}) | ↑{post['score']} | 💬{post['num_comments']}\n\n"
-                    
-                    return header + analysis
-                
-            except Exception as e:
-                logger.error(f"OpenAI API error: {e}")
-                return None
-            
-            return None
-        
+            combined_content += post_text + "\n\n"
+
+        try:
+            if self.config.use_zai == "false":
+                response = self.openai_client.chat.completions.create(
+                    model=self.config.model_name,
+                    messages=[
+                        {"role": "system", "content": self.config.analysis_prompt},
+                        {"role": "user", "content": f"CONTENT TO ANALYZE:\n{combined_content}"}
+                    ],
+                    max_tokens=4000,
+                    temperature=0.7
+                )
+            else:
+                print(combined_content)
+                response = self.zai_client.chat.completions.create(
+                    model=self.config.model_name,
+                    messages=[
+                        {"role": "system", "content": self.config.analysis_prompt},
+                        {"role": "user", "content": f"CONTENT TO ANALYZE:\n{combined_content}"}
+                    ],
+                    thinking={"type": "disabled"},
+                    max_tokens=4000,
+                    temperature=0.7
+                )
+
+            analysis = response.choices[0].message.content.strip()
+            if analysis:
+                return analysis
+
         except Exception as e:
-            logger.error(f"Error analyzing post {post['id']}: {e}")
+            logger.error(f"AI API error while analyzing posts batch: {e}")
             return None
 
+        return None
 
 class TelegramBot:
     """Main Telegram bot class"""
@@ -272,21 +258,18 @@ class TelegramBot:
         
         @self.bot.message_handler(commands=['start'])
         def send_welcome(message):
-            welcome_text = """
-🤖 **Personal Reddit Analyzer Bot**
-
-I analyze Reddit posts and comments to extract valuable insights using AI!
-
-**Commands:**
-• `/start` - Show this welcome message
-• `/analyze` - Manually trigger analysis now
-• `/subreddits` - View and manage your subreddits
-• `/status` - Check bot status and statistics
-• `/settings` - Bot settings and configuration
-
-I automatically analyze posts every 2 hours and send you summaries of interesting content.
-
-**Current Subreddits:** """ + ", ".join(f"r/{sub}" for sub in self.config.subreddits)
+            welcome_text = f"""
+<b>🤖 Personal Reddit Analyzer Bot</b>\n\n
+I analyze Reddit posts and comments to extract valuable insights using AI!\n\n
+<b>Commands:</b>\n
+• /start - Show this welcome message\n
+• /analyze - Manually trigger analysis now\n
+• /subreddits - View and manage your subreddits\n
+• /status - Check bot status and statistics\n
+• /settings - Bot settings and configuration\n\n
+I automatically analyze posts every 2 hours and send you summaries of interesting content.\n\n
+<b>Current Subreddits:</b> {', '.join(f'r/{sub}' for sub in self.config.subreddits)}
+"""
             
             keyboard = InlineKeyboardMarkup()
             keyboard.row(
@@ -294,7 +277,7 @@ I automatically analyze posts every 2 hours and send you summaries of interestin
                 InlineKeyboardButton("📋 Manage Subreddits", callback_data="manage_subreddits")
             )
             
-            self.bot.reply_to(message, welcome_text, reply_markup=keyboard, parse_mode='Markdown')
+            self.bot.reply_to(message, welcome_text, reply_markup=keyboard, parse_mode='HTML')
         
         @self.bot.message_handler(commands=['analyze'])
         def manual_analyze(message):
@@ -303,7 +286,7 @@ I automatically analyze posts every 2 hours and send you summaries of interestin
         
         @self.bot.message_handler(commands=['subreddits'])
         def show_subreddits(message):
-            text = f"📋 **Your Monitored Subreddits:**\n\n"
+            text = "<b>📋 Your Monitored Subreddits:</b>\n\n"
             for i, sub in enumerate(self.config.subreddits, 1):
                 text += f"{i}. r/{sub}\n"
             
@@ -313,38 +296,34 @@ I automatically analyze posts every 2 hours and send you summaries of interestin
                 InlineKeyboardButton("➕ Add Subreddit", callback_data="add_subreddit")
             )
             
-            self.bot.reply_to(message, text, reply_markup=keyboard, parse_mode='Markdown')
+            self.bot.reply_to(message, text, reply_markup=keyboard, parse_mode='HTML')
         
         @self.bot.message_handler(commands=['status'])
         def show_status(message):
             status_text = f"""
-📊 **Bot Status**
-
-🔹 **Active Subreddits:** {len(self.config.subreddits)}
-🔹 **Processed Posts:** {len(self.reddit_analyzer.processed_posts)}
-🔹 **Last Analysis:** Check logs for details
-🔹 **Auto-Analysis:** Every 2 hours
-
-**Monitored Subreddits:**
-{chr(10).join(f'• r/{sub}' for sub in self.config.subreddits)}
-            """
+<b>📊 Bot Status</b>\n\n
+🔹 <b>Active Subreddits:</b> {len(self.config.subreddits)}\n
+🔹 <b>Processed Posts:</b> {len(self.reddit_analyzer.processed_posts)}\n
+🔹 <b>Last Analysis:</b> Check logs for details\n
+🔹 <b>Auto-Analysis:</b> Every 2 hours\n\n
+<b>Monitored Subreddits:</b>\n
+{'\n'.join(f'• r/{sub}' for sub in self.config.subreddits)}
+"""
             
             keyboard = InlineKeyboardMarkup()
             keyboard.add(InlineKeyboardButton("🔄 Analyze Now", callback_data="analyze_now"))
             
-            self.bot.reply_to(message, status_text, reply_markup=keyboard, parse_mode='Markdown')
+            self.bot.reply_to(message, status_text, reply_markup=keyboard, parse_mode='HTML')
         
         @self.bot.message_handler(commands=['settings'])
         def show_settings(message):
             settings_text = f"""
-⚙️ **Bot Settings**
-
-📝 **Analysis Prompt:** Loaded from `prompt.txt`
-📋 **Subreddits:** Loaded from `subreddits.txt`
-
+<b>⚙️ Bot Settings</b>\n\n
+📝 <b>Analysis Prompt:</b> Loaded from prompt.txt\n
+📋 <b>Subreddits:</b> Loaded from subreddits.txt\n\n
 You can edit these files directly to customize the bot's behavior.
-            """
-            self.bot.reply_to(message, settings_text, parse_mode='Markdown')
+"""
+            self.bot.reply_to(message, settings_text, parse_mode='HTML')
         
         @self.bot.callback_query_handler(func=lambda call: True)
         def callback_query(call):
@@ -356,7 +335,8 @@ You can edit these files directly to customize the bot's behavior.
             elif call.data == "edit_subreddits":
                 self.bot.send_message(
                     call.message.chat.id,
-                    "📝 **Edit Subreddit List**\n\nSend me a comma-separated list of subreddits (without r/):\n\n**Example:** `Python,MachineLearning,Programming,DataScience`"
+                    "<b>📝 Edit Subreddit List</b>\n\nSend me a comma-separated list of subreddits (without r/):\n\n<i>Example:</i> Python,MachineLearning,Programming,DataScience",
+                    parse_mode='HTML'
                 )
                 self.bot.register_next_step_handler_by_chat_id(
                     call.message.chat.id, self._process_subreddit_update
@@ -364,7 +344,8 @@ You can edit these files directly to customize the bot's behavior.
             elif call.data == "add_subreddit":
                 self.bot.send_message(
                     call.message.chat.id,
-                    "➕ **Add Subreddit**\n\nSend me the name of the subreddit to add (without r/):\n\n**Example:** `Python`"
+                    "<b>➕ Add Subreddit</b>\n\nSend me the name of the subreddit to add (without r/):\n\n<i>Example:</i> Python",
+                    parse_mode='HTML'
                 )
                 self.bot.register_next_step_handler_by_chat_id(
                     call.message.chat.id, self._process_add_subreddit
@@ -374,19 +355,17 @@ You can edit these files directly to customize the bot's behavior.
         def handle_all_messages(message):
             self.bot.reply_to(
                 message, 
-                "👋 Use `/start` to see available commands, or `/analyze` to analyze Reddit posts now!"
+                "👋 Use /start to see available commands, or /analyze to analyze Reddit posts now!"
             )
     
     def _show_subreddit_manager(self, chat_id):
         """Show subreddit management interface"""
         text = f"""
-📋 **Subreddit Manager**
-
-**Currently monitoring:**
-{chr(10).join(f'• r/{sub}' for sub in self.config.subreddits)}
-
-**Total:** {len(self.config.subreddits)} subreddits
-        """
+<b>📋 Subreddit Manager</b>\n\n
+<b>Currently monitoring:</b>\n
+{'\n'.join(f'• r/{sub}' for sub in self.config.subreddits)}\n\n
+<b>Total:</b> {len(self.config.subreddits)} subreddits
+"""
         
         keyboard = InlineKeyboardMarkup()
         keyboard.row(
@@ -394,7 +373,7 @@ You can edit these files directly to customize the bot's behavior.
             InlineKeyboardButton("➕ Add One", callback_data="add_subreddit")
         )
         
-        self.bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='Markdown')
+        self.bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='HTML')
     
     def _process_subreddit_update(self, message):
         """Process subreddit list update"""
@@ -408,10 +387,10 @@ You can edit these files directly to customize the bot's behavior.
             
             self.config.set_subreddits(subreddits)
             
-            response_text = f"✅ **Subreddit List Updated!**\n\n**Now monitoring:**\n"
+            response_text = "<b>✅ Subreddit List Updated!</b>\n\n<b>Now monitoring:</b>\n"
             response_text += "\n".join(f"• r/{sub}" for sub in subreddits)
             
-            self.bot.reply_to(message, response_text, parse_mode='Markdown')
+            self.bot.reply_to(message, response_text, parse_mode='HTML')
         
         except Exception as e:
             logger.error(f"Error updating subreddits: {e}")
@@ -436,56 +415,62 @@ You can edit these files directly to customize the bot's behavior.
         except Exception as e:
             logger.error(f"Error adding subreddit: {e}")
             self.bot.reply_to(message, "❌ Error adding subreddit. Please try again.")
-    
+        
     def _perform_analysis(self, chat_id):
-        """Perform Reddit analysis and send results"""
+        """Perform Reddit analysis and send results (batch per subreddit)"""
         try:
             self.bot.send_message(
-                chat_id, 
-                f"🔍 **Starting Analysis**\n\nAnalyzing posts from: {', '.join(f'r/{sub}' for sub in self.config.subreddits)}"
+                chat_id,
+                f"🔍 <b>Starting Analysis</b>\n\nAnalyzing posts from: {', '.join(f'r/{sub}' for sub in self.config.subreddits)}",
+                parse_mode='HTML'
             )
-            
+
             total_analyses = 0
+            posts_count_per_sub = {}  # <--- لتخزين عدد البوستات لكل مجتمع
+
             for subreddit in self.config.subreddits:
                 try:
-                    self.bot.send_message(chat_id, f"📡 Fetching from r/{subreddit}...")
-                    posts = self.reddit_analyzer.fetch_posts(subreddit, limit=10)
-                    
+                    self.bot.send_message(chat_id, f"📡 Fetching from r/{subreddit}...", parse_mode='HTML')
+                    posts = self.reddit_analyzer.fetch_posts(subreddit, limit=8)
+                    posts_count_per_sub[subreddit] = len(posts)  # <--- حفظ عدد البوستات
+
                     if not posts:
                         continue
-                    
-                    for post in posts:
-                        analysis = self.reddit_analyzer.analyze_post(post)
-                        if analysis:
-                            # Split long messages if needed
-                            if len(analysis) > 4000:
-                                parts = [analysis[i:i+3800] for i in range(0, len(analysis), 3800)]
-                                for i, part in enumerate(parts):
-                                    if i == 0:
-                                        self.bot.send_message(chat_id, part, parse_mode='Markdown', disable_web_page_preview=True)
-                                    else:
-                                        self.bot.send_message(chat_id, f"**...continued**\n\n{part}", parse_mode='Markdown')
-                            else:
-                                self.bot.send_message(chat_id, analysis, parse_mode='Markdown', disable_web_page_preview=True)
-                            
-                            total_analyses += 1
-                            time.sleep(2)  # Rate limiting between messages
-                
+
+                    analysis = self.reddit_analyzer.analyze_posts_batch(posts)
+                    if analysis:
+                        if len(analysis) > 4000:
+                            parts = [analysis[i:i+3800] for i in range(0, len(analysis), 3800)]
+                            for i, part in enumerate(parts):
+                                if i == 0:
+                                    self.bot.send_message(chat_id, part, parse_mode='HTML', disable_web_page_preview=True)
+                                else:
+                                    self.bot.send_message(chat_id, f"<b>...continued</b>\n\n{part}", parse_mode='HTML')
+                        else:
+                            self.bot.send_message(chat_id, analysis, parse_mode='HTML', disable_web_page_preview=True)
+                        
+                        total_analyses += 1
+                        time.sleep(2)
+
                 except Exception as e:
                     logger.error(f"Error analyzing r/{subreddit}: {e}")
-                    self.bot.send_message(chat_id, f"⚠️ Error analyzing r/{subreddit}: {str(e)}")
+                    self.bot.send_message(chat_id, f"⚠️ Error analyzing r/{subreddit}: {str(e)}", parse_mode='HTML')
                     continue
-            
-            # Summary message
+
+            # إرسال ملخص بعد اكتمال التحليل
             if total_analyses == 0:
-                self.bot.send_message(chat_id, "📭 **No New Content**\n\nNo new interesting posts found in your monitored subreddits.")
+                self.bot.send_message(chat_id, "<b>📭 No New Content</b>\n\nNo new interesting posts found.", parse_mode='HTML')
             else:
-                self.bot.send_message(chat_id, f"✅ **Analysis Complete!**\n\nProcessed {total_analyses} interesting posts.")
-        
+                summary_text = "✅ <b>Analysis Complete!</b>\n\n"
+                for sub, count in posts_count_per_sub.items():
+                    summary_text += f"• r/{sub}: {count} posts\n"
+                self.bot.send_message(chat_id, summary_text, parse_mode='HTML')
+
         except Exception as e:
             logger.error(f"Error in analysis: {e}")
-            self.bot.send_message(chat_id, f"❌ **Analysis Error**\n\n{str(e)}")
-    
+            self.bot.send_message(chat_id, f"❌ <b>Analysis Error</b>\n\n{str(e)}", parse_mode='HTML')
+
+
     def _start_scheduler(self):
         """Start the background scheduler"""
         self.scheduler.add_job(
@@ -502,8 +487,6 @@ You can edit these files directly to customize the bot's behavior.
         logger.info("Starting scheduled Reddit analysis")
         
         try:
-            # You'll need to set your personal chat ID here
-            # You can get it by messaging the bot and checking the logs
             personal_chat_id = os.getenv('PERSONAL_CHAT_ID')
             
             if personal_chat_id:

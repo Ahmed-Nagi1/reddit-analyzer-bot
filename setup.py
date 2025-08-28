@@ -18,11 +18,12 @@ TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 # OpenAI Configuration  
 OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_BASE_URL=https://api.openai.com/v1
-MODEL_NAME=your_model_name
 
 # z.ai configuration for free GLM-4.5-Flash model
 USE_ZAI=false  #true or false
 ZAI_API_KEY=your_zai_api_key_here
+
+MODEL_NAME=your_model_name
 
 # Reddit API Configuration
 REDDIT_CLIENT_ID=your_reddit_client_id_here
@@ -53,7 +54,9 @@ Technology""")
     if not os.path.exists('prompt.txt'):
         print("Creating prompt.txt...")
         with open('prompt.txt', 'w') as f:
-            f.write("""Analyze the following Reddit post and comments. Extract and summarize:
+            f.write("""Start your summary with name of community
+
+Analyze the following Reddit post and comments. Extract and summarize:
 
 1. **Key Insights**: New information, discoveries, or important findings
 2. **Interesting Discussions**: Notable debates, conversations, or different viewpoints  
@@ -72,7 +75,12 @@ Prioritize:
 - Expert opinions or insider knowledge  
 - Breaking news or updates
 - Technical insights or tutorials
-- Community discussions with high engagement""")
+- Community discussions with high engagement
+
+
+You are a Telegram bot.  
+- Output: single string, ≤4000 characters, ready for Telegram HTML.  
+- Use only the following supported tags: <b>, <i>, <u>, <s>, <em>, <code>, <pre>, <strong>, <blockquote>,  ,<a href="URL">, <code>, <pre>. - Do NOT use any other tags such as <ul>, <li>, <div>, <span>, <h1>, etc. - Make sure all tags are properly closed. - Use <b> and <i> only for formatting headings. - Do not include any unsupported tags, even if they exist in the original text.""")
         print("✅ Created prompt.txt with default analysis prompt")
     else:
         print("✅ prompt.txt already exists")
